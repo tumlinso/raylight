@@ -21,15 +21,11 @@ from .distributed_worker.ray_worker import (
 )
 
 
-# Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
-# since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
+# Ensure ComfyUI model config is picklable inside Ray workers.
 def _monkey():
-    from raylight.comfy_dist.supported_models_base import BASE as PatchedBASE
-    import comfy.supported_models_base as supported_models_base
-    OriginalBASE = supported_models_base.BASE
+    from raylight.compat import patch_comfy_model_config_pickle
 
-    if hasattr(PatchedBASE, "__getattr__"):
-        setattr(OriginalBASE, "__getattr__", PatchedBASE.__getattr__)
+    patch_comfy_model_config_pickle()
 
 
 def _resolve_module_dir(module):
@@ -224,23 +220,33 @@ class RayInitializer:
         runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
         if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
             runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
+        runtime_env = deepcopy(runtime_env_base)
+        env_vars = runtime_env.setdefault("env_vars", {})
+        env_vars["MASTER_ADDR"] = torch_host
+        env_vars["MASTER_PORT"] = torch_port
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
-            ray.init(
-                ray_cluster_address,
-                namespace=ray_cluster_namespace,
-                runtime_env=deepcopy(runtime_env_base),
-                object_store_memory=ray_object_store_gb,
-                include_dashboard=enable_dashboard,
-                dashboard_host=dashboard_host,
-                dashboard_port=dashboard_port
-            )
+            ray_init_kwargs = {
+                "namespace": ray_cluster_namespace,
+                "runtime_env": runtime_env,
+            }
+            if ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES:
+                ray_init_kwargs.update({
+                    "object_store_memory": ray_object_store_gb,
+                    "include_dashboard": enable_dashboard,
+                    "dashboard_host": dashboard_host,
+                    "dashboard_port": dashboard_port,
+                })
+            else:
+                ray_init_kwargs["address"] = ray_cluster_address
+
+            ray.init(**ray_init_kwargs)
         except Exception as e:
             ray.shutdown()
             ray.init(
-                runtime_env=deepcopy(runtime_env_base)
+                runtime_env=runtime_env
             )
             raise RuntimeError(f"Ray connection failed: {e}")
 

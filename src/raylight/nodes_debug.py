@@ -115,22 +115,25 @@ class RayInitializerDebug:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
 
+        runtime_env = {
+            "py_modules": [raylight],
+            "env_vars": {
+                "MASTER_ADDR": os.environ.get("MASTER_ADDR", "127.0.0.1"),
+                "MASTER_PORT": os.environ.get("MASTER_PORT", "29500"),
+            },
+        }
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
-                runtime_env={
-                    "py_modules": [raylight],
-                },
+                runtime_env=runtime_env,
             )
         except Exception as e:
             ray.shutdown()
             ray.init(
-                runtime_env={
-                    "py_modules": [raylight],
-                }
+                runtime_env=runtime_env
             )
             raise RuntimeError(f"Ray connection failed: {e}")
 
