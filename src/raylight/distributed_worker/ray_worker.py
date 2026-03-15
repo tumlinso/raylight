@@ -47,19 +47,18 @@ class RayWorker:
         self.local_rank = local_rank
         self.global_world_size = self.parallel_dict["global_world_size"]
 
+        # physical device id requested by caller; workers operate on cuda:0 after masking
         self.device_id = device_id
         self.parallel_dict = parallel_dict
-        self.device = torch.device(f"cuda:{self.device_id}")
+        self.device = torch.device("cuda:0")
         self.device_mesh = None
-        self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
+        self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability(self.device)))
 
         self.is_model_loaded = False
         self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
 
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
         os.environ["NCCL_DEBUG"] = "WARN"
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-
         if sys.platform.startswith("linux"):
             dist.init_process_group(
                 "nccl",
@@ -72,6 +71,14 @@ class RayWorker:
             os.environ["USE_LIBUV"] = "0"
             dist.init_process_group(
                 "gloo",
+                rank=local_rank,
+                world_size=self.global_world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
+        else:
+            dist.init_process_group(
+                "nccl",
                 rank=local_rank,
                 world_size=self.global_world_size,
                 timeout=timedelta(minutes=1),
@@ -400,10 +407,7 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-        else:
-            self.model.detach()
+        self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return out
@@ -476,12 +480,7 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-
-        # I haven't implemented for non FSDP detached, so all rank model will be move into RAM
-        else:
-            self.model.detach()
+        self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)
@@ -489,8 +488,8 @@ class RayWorker:
 
 class RayCOMMTester:
     def __init__(self, local_rank, world_size, device_id):
-        device = torch.device(f"cuda:{device_id}")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        # workers run against a single masked device, so cuda:0 is always the assigned GPU
+        device = torch.device("cuda:0")
 
         if sys.platform.startswith("linux"):
             dist.init_process_group(
@@ -506,6 +505,14 @@ class RayCOMMTester:
                 print("Windows detected, falling back to GLOO backend, consider using WSL, GLOO is slower than NCCL")
             dist.init_process_group(
                 "gloo",
+                rank=local_rank,
+                world_size=world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
+        else:
+            dist.init_process_group(
+                "nccl",
                 rank=local_rank,
                 world_size=world_size,
                 timeout=timedelta(minutes=1),
@@ -535,18 +542,38 @@ class RayCOMMTester:
         ray.actor.exit_actor()
 
 
-def ray_nccl_tester(world_size):
+def ray_nccl_tester(world_size, device_priority=None):
     gpu_actor = ray.remote(RayCOMMTester)
     gpu_actors = []
-
-    for local_rank in range(world_size):
-        gpu_actors.append(
-            gpu_actor.options(num_gpus=1, name=f"RayTest:{local_rank}").remote(
-                local_rank=local_rank,
-                world_size=world_size,
-                device_id=0,
+    if device_priority is None:
+        for local_rank in range(world_size):
+            gpu_actors.append(
+                gpu_actor.options(
+                    num_gpus=1,
+                    name=f"RayTest:{local_rank}",
+                ).remote(
+                    local_rank=local_rank,
+                    world_size=world_size,
+                    device_id=0
+                )
             )
-        )
+    else:
+        device_priority = list(device_priority)
+        for local_rank, device_id in enumerate(device_priority):
+            gpu_actors.append(
+                gpu_actor.options(
+                    num_gpus=0,
+                    name=f"RayTest:{local_rank}",
+                    runtime_env={"env_vars": {
+                        "CUDA_VISIBLE_DEVICES": str(device_id),
+                        "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+                    }},
+                ).remote(
+                    local_rank=local_rank,
+                    world_size=world_size,
+                    device_id=device_id
+                )
+            )
     for actor in gpu_actors:
         ray.get(actor.__ray_ready__.remote())
 
@@ -556,7 +583,8 @@ def ray_nccl_tester(world_size):
 
 def make_ray_actor_fn(
     world_size,
-    parallel_dict
+    parallel_dict,
+    device_priority=None
 ):
     def _init_ray_actor(
         world_size=world_size,
@@ -565,15 +593,35 @@ def make_ray_actor_fn(
         ray_actors = dict()
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
-
-        for local_rank in range(world_size):
-            gpu_actors.append(
-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank,
-                    device_id=0,
-                    parallel_dict=parallel_dict,
+        if device_priority is None:
+            for local_rank in range(world_size):
+                gpu_actors.append(
+                    gpu_actor.options(
+                        num_gpus=1,
+                        name=f"RayWorker:{local_rank}",
+                    ).remote(
+                        local_rank=local_rank,
+                        device_id=0,
+                        parallel_dict=parallel_dict,
+                    )
                 )
-            )
+        else:
+            device_order = list(device_priority)
+            for local_rank, device_id in enumerate(device_order):
+                gpu_actors.append(
+                    gpu_actor.options(
+                        num_gpus=0,
+                        name=f"RayWorker:{local_rank}",
+                        runtime_env={"env_vars": {
+                            "CUDA_VISIBLE_DEVICES": str(device_id),
+                            "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+                        }},
+                    ).remote(
+                        local_rank=local_rank,
+                        device_id=device_id,
+                        parallel_dict=parallel_dict,
+                    )
+                )
         ray_actors["workers"] = gpu_actors
 
         for actor in ray_actors["workers"]:

@@ -1,6 +1,9 @@
 import raylight
 import os
 import gc
+import re
+import itertools
+import subprocess
 from typing import Any
 from pathlib import Path
 from copy import deepcopy
@@ -108,6 +111,201 @@ _RAY_RUNTIME_ENV_REMOTE = _build_remote_runtime_env(_RAYLIGHT_MODULE_PATH, _COMF
 _LOCAL_CLUSTER_ADDRESSES = {None, '', 'local', 'LOCAL'}
 
 
+def _link_cost(label: str) -> int:
+    label = (label or "").upper()
+    if label.startswith("NV"):
+        return 0
+    if label in {"PIX", "PXB"}:
+        return 1
+    if label == "PHB":
+        return 2
+    if label == "NODE":
+        return 3
+    if label == "SYS":
+        return 4
+    if label == "X":
+        return 0
+    return 5
+
+
+def _read_gpu_topology() -> dict[tuple[int, int], int] | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "topo", "-m"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+
+    lines = [line.rstrip() for line in result.stdout.splitlines() if line.strip()]
+    header_idx = None
+    gpu_headers: list[str] = []
+
+    for idx, line in enumerate(lines):
+        tokens = line.split()
+        maybe_headers = [t for t in tokens if re.fullmatch(r"GPU\d+", t)]
+        if len(maybe_headers) >= 2:
+            header_idx = idx
+            gpu_headers = maybe_headers
+            break
+
+    if header_idx is None:
+        return None
+
+    num_gpus = len(gpu_headers)
+    matrix: dict[tuple[int, int], int] = {}
+
+    for line in lines[header_idx + 1:]:
+        tokens = line.split()
+        if not tokens or not re.fullmatch(r"GPU\d+", tokens[0]):
+            continue
+        row = int(tokens[0][3:])
+        links = tokens[1: 1 + num_gpus]
+        if len(links) < num_gpus:
+            continue
+        for col, link in enumerate(links):
+            matrix[(row, col)] = _link_cost(link)
+
+    return matrix if matrix else None
+
+
+def _ring_groups_for_order(order: list[int], ulysses_degree: int, ring_degree: int) -> list[list[int]]:
+    if ring_degree <= 1:
+        return []
+    groups = []
+    for i in range(ulysses_degree):
+        groups.append([order[i + k * ulysses_degree] for k in range(ring_degree)])
+    return groups
+
+
+def _ulysses_groups_for_order(order: list[int], ulysses_degree: int, ring_degree: int) -> list[list[int]]:
+    if ulysses_degree <= 1:
+        return []
+    groups = []
+    for i in range(ring_degree):
+        start = i * ulysses_degree
+        groups.append(order[start: start + ulysses_degree])
+    return groups
+
+
+def _score_order(
+    order: list[int],
+    topology: dict[tuple[int, int], int],
+    ulysses_degree: int,
+    ring_degree: int,
+    ring_weight: int = 4,
+    ulysses_weight: int = 1,
+) -> int:
+    score = 0
+
+    for group in _ring_groups_for_order(order, ulysses_degree, ring_degree):
+        if len(group) <= 1:
+            continue
+        for i in range(len(group)):
+            a = group[i]
+            b = group[(i + 1) % len(group)]
+            score += ring_weight * topology.get((a, b), 5)
+
+    for group in _ulysses_groups_for_order(order, ulysses_degree, ring_degree):
+        if len(group) <= 1:
+            continue
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a = group[i]
+                b = group[j]
+                score += ulysses_weight * topology.get((a, b), 5)
+
+    return score
+
+
+def _auto_device_priority(
+    world_size: int,
+    max_world_size: int,
+    ulysses_degree: int,
+    ring_degree: int,
+) -> list[int]:
+    default_order = list(range(world_size))
+    if world_size <= 1:
+        return default_order
+
+    topology = _read_gpu_topology()
+    if topology is None:
+        return default_order
+
+    candidate_devices = list(range(max_world_size))
+    # Keep search bounded; expected practical values are <= 8.
+    if max_world_size > 8 or world_size > 8:
+        return default_order
+
+    best_order = default_order
+    best_score: int | None = None
+
+    for subset in itertools.combinations(candidate_devices, world_size):
+        for perm in itertools.permutations(subset):
+            order = list(perm)
+            score = _score_order(order, topology, ulysses_degree, ring_degree)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_order = order
+
+    return best_order
+
+
+def _normalize_device_priority(device_priority, world_size: int, max_world_size: int) -> list[int]:
+    if device_priority is None:
+        return list(range(world_size))
+
+    priority = [int(device_id) for device_id in device_priority]
+    if len(priority) != world_size:
+        raise ValueError(
+            f"Length of ray_device_priority list must match the number of specified GPUs ({world_size})."
+        )
+    if len(set(priority)) != len(priority):
+        raise ValueError("ray_device_priority contains duplicate device ids.")
+    if any(device_id >= max_world_size or device_id < 0 for device_id in priority):
+        raise ValueError(
+            f"Invalid device id in priority list. Available GPU ids are from 0 to {max_world_size - 1}."
+        )
+    return priority
+
+
+# list of ray devices in order of priority, 
+# if CUDA0 and CUDA2, CUDA1 and CUDA3 share nvlink for example, 
+# priority should be [0, 2, 1, 3] to maximize nvlink usage. 
+class RayDevicePriority:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "device_priority": (
+                    "STRING",
+                    {
+                        "default": "0,2,1,3",
+                        "tooltip": "Comma separated list of GPU device ids in order of priority for Ray to assign actors. For example, '0,2,1,3' will prioritize CUDA0 and CUDA2 over CUDA1 and CUDA3.",
+                    },
+                ),
+            }
+        }
+    
+    RETURN_TYPES = ("RAY_DEVICE_PRIORITY",)
+    RETURN_NAMES = ("device_priority",)
+
+    FUNCTION = "get_device_priority"
+    CATEGORY = "Raylight"
+
+    def get_device_priority(self, device_priority):
+        priority_list = [int(x.strip()) for x in device_priority.split(",")]
+        available_gpus = torch.cuda.device_count()
+        if len(set(priority_list)) != len(priority_list):
+            raise ValueError("Device priority contains duplicate ids.")
+        if any(device_id >= available_gpus or device_id < 0 for device_id in priority_list):
+            raise ValueError(f"Invalid device id in priority list. Available GPU ids are from 0 to {available_gpus - 1}.")
+        return (priority_list,)
+
+
 class RayInitializer:
     @classmethod
     def INPUT_TYPES(s):
@@ -126,7 +324,12 @@ class RayInitializer:
                     [member.name for member in AttnType],
                     {"default": "TORCH"},
                 ),
+                "test_nccl": ("BOOLEAN", {"default": True, "tooltip": "Run a quick NCCL test after initializing Ray to verify that the actors can communicate properly. This is recommended to catch any configuration issues early."}),
+            },
+            "optional": {
+                "ray_device_priority": ("RAY_DEVICE_PRIORITY", {"default": None}),
             }
+
         }
 
     RETURN_TYPES = ("RAY_ACTORS_INIT",)
@@ -149,7 +352,9 @@ class RayInitializer:
         XFuser_attention: int,
         ray_object_store_gb: float = 2.0,
         ray_dashboard_address: str = "None",
-        torch_dist_address: str = "None"
+        torch_dist_address: str = "None",
+        ray_device_priority=None,
+        test_nccl: bool = True,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -174,6 +379,17 @@ class RayInitializer:
             raise ValueError("Too many gpus")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
+        custom_device_priority: list[int] | None = None
+        if ray_device_priority is not None:
+            custom_device_priority = _normalize_device_priority(ray_device_priority, world_size, max_world_size)
+        else:
+            custom_device_priority = _auto_device_priority(
+                world_size=world_size,
+                max_world_size=max_world_size,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
+            )
+            print(f"[Raylight] Auto device order: {custom_device_priority}")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
             raise ValueError(
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
@@ -250,8 +466,10 @@ class RayInitializer:
             )
             raise RuntimeError(f"Ray connection failed: {e}")
 
-        ray_nccl_tester(world_size)
-        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+        if test_nccl:
+            ray_nccl_tester(world_size, custom_device_priority)
+            
+        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict, custom_device_priority)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
 
@@ -259,43 +477,47 @@ class RayInitializer:
 class RayInitializerAdvanced(RayInitializer):
     @classmethod
     def INPUT_TYPES(s):
+        input_types = RayInitializer.INPUT_TYPES()
+        required = dict(input_types["required"])
+
+        required["ray_cluster_address"] = ("STRING", {
+            "default": "local",
+            "tooltip": "Address of Ray cluster different than torch distributed address"})
+        required["ray_cluster_namespace"] = ("STRING", {"default": "default"})
+        required["ray_object_store_gb"] = ("FLOAT", {
+            "default": 2.0,
+            "tooltip": "Ray global object store, default is plenty enough"})
+        required["ray_dashboard_address"] = ("STRING", {
+            "default": "None",
+            "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"})
+        required["torch_dist_address"] = ("STRING", {
+            "default": "127.0.0.1:29500",
+            "tooltip": "Might need to restart ComfyUI to apply"})
+        required["GPU"] = ("INT", {"default": 2})
+        required["ulysses_degree"] = ("INT", {"default": 2})
+        required["ring_degree"] = ("INT", {"default": 1})
+        required["cfg_degree"] = ("INT", {"default": 1})
+        required["sync_ulysses"] = ("BOOLEAN", {"default": False})
+        required["FSDP"] = ("BOOLEAN", {"default": False})
+        required["FSDP_CPU_OFFLOAD"] = ("BOOLEAN", {"default": False})
+        required["XFuser_attention"] = (
+            [
+                "TORCH",
+                "FLASH_ATTN",
+                "FLASH_ATTN_3",
+                "SAGE_AUTO_DETECT",
+                "SAGE_FP16_TRITON",
+                "SAGE_FP16_CUDA",
+                "SAGE_FP8_CUDA",
+                "SAGE_FP8_SM90",
+                "AITER_ROCM",
+            ],
+            {"default": "TORCH"},
+        )
+
         return {
-            "required": {
-                "ray_cluster_address": ("STRING", {
-                    "default": "local",
-                    "tooltip": "Address of Ray cluster different than torch distributed address"}),
-                "ray_cluster_namespace": ("STRING", {"default": "default"}),
-                "ray_object_store_gb": ("FLOAT", {
-                    "default": 2.0,
-                    "tooltip": "Ray global object store, default is plenty enough"}),
-                "ray_dashboard_address": ("STRING", {
-                    "default": "None",
-                    "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
-                "torch_dist_address": ("STRING", {
-                    "default": "127.0.0.1:29500",
-                    "tooltip": "Might need to restart ComfyUI to apply"}),
-                "GPU": ("INT", {"default": 2}),
-                "ulysses_degree": ("INT", {"default": 2}),
-                "ring_degree": ("INT", {"default": 1}),
-                "cfg_degree": ("INT", {"default": 1}),
-                "sync_ulysses": ("BOOLEAN", {"default": False}),
-                "FSDP": ("BOOLEAN", {"default": False}),
-                "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
-                "XFuser_attention": (
-                    [
-                        "TORCH",
-                        "FLASH_ATTN",
-                        "FLASH_ATTN_3",
-                        "SAGE_AUTO_DETECT",
-                        "SAGE_FP16_TRITON",
-                        "SAGE_FP16_CUDA",
-                        "SAGE_FP8_CUDA",
-                        "SAGE_FP8_SM90",
-                        "AITER_ROCM",
-                    ],
-                    {"default": "TORCH"},
-                ),
-            }
+            "required": required,
+            "optional": input_types.get("optional", {}),
         }
 
     RETURN_TYPES = ("RAY_ACTORS_INIT",)
@@ -778,7 +1000,8 @@ NODE_CLASS_MAPPINGS = {
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
-    "RayVAEDecodeDistributed": RayVAEDecodeDistributed
+    "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
+    "RayDevicePriority": RayDevicePriority
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -789,5 +1012,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
-    "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
+    "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
+    "RayDevicePriority": "Ray Device Priority",
 }
